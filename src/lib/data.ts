@@ -23,6 +23,7 @@ import { isSupabaseConfigured } from "./env";
 import { getApiModelAdminData } from "./api-models-db";
 import { normalizeCollectorKind } from "./collector-registry";
 import { getOfficialSubscriptionAdminData } from "./official-prices-db";
+import { getEmptyOutboundAnalyticsSummary, getOutboundAnalyticsSummary } from "./outbound-analytics";
 import {
   buildOfferFilterFacets,
   deriveOfferFilterTags,
@@ -63,7 +64,7 @@ import {
   type ProductOfferFreshnessMinutes,
   type ProductOfferStockThreshold,
 } from "./product-offer-filters";
-import { PRICE_DATA_CACHE_TTL_MS } from "./public-cache-policy";
+import { PRICE_DATA_CACHE_TTL_MS, priceDataCacheTtlMsForProduct } from "./public-cache-policy";
 import { seedRawOffers, seedSources } from "./sample-data";
 import { getSupabaseServerClient } from "./supabase";
 import { API_CDK_PLATFORM, getPublicRiskPrecheck, isPublicCatalogProduct } from "./trust-risk";
@@ -107,7 +108,6 @@ const SUPABASE_PAGE_SIZE = 1000;
 const PUBLIC_FALLBACK_MAX_ROWS = 5000;
 const PUBLIC_DATA_CACHE_TTL_MS = PRICE_DATA_CACHE_TTL_MS;
 const EXPLORER_DATA_CACHE_TTL_MS = PRICE_DATA_CACHE_TTL_MS;
-const PRODUCT_OFFERS_CACHE_TTL_MS = PRICE_DATA_CACHE_TTL_MS;
 const PUBLIC_SUPABASE_READ_TIMEOUT_MS = 2_500;
 const PUBLIC_SUPABASE_REFRESH_READ_TIMEOUT_MS = 15_000;
 const PUBLIC_SUPABASE_BUILD_READ_TIMEOUT_MS = 15_000;
@@ -178,6 +178,7 @@ const PRIMARY_COLLECTOR_NODE_IDS = new Set([
   "aliyun7-heyuan-shop-vip-scheduler-lane-1",
   "aliyun7-new-47-121-priceai-qxvx",
   "aliyun7-new-47-121-priceai-yunmao",
+  "shanghai-hot-1",
 ]);
 const PUBLIC_EXPLORER_SNAPSHOT_KEY = "default";
 const PUBLIC_OFFERS_SNAPSHOT_LIMIT = PUBLIC_OFFER_DEFAULT_LIMIT;
@@ -892,7 +893,6 @@ function productIdFromRawOfferScopeRow(row: Record<string, unknown>): string | n
   const tags = Array.isArray(row.tags) ? row.tags.map(String) : [];
   return classifyOffer(String(row.source_title || ""), {
     tags,
-    price: typeof row.price === "number" ? row.price : null,
   }).id;
 }
 
@@ -1616,6 +1616,7 @@ export function getEmptyAdminSummary(isAuthenticated = false): AdminSummary {
     feedbackRawOffers: [],
     riskReviewSettings: getFallbackRiskReviewSettingsSummary("尚未加载风险预审配置。"),
     sponsorSettings: getFallbackSponsorSettingsSummary("尚未加载赞助位配置。"),
+    outboundAnalytics: getEmptyOutboundAnalyticsSummary("尚未加载点击归因数据。"),
     communitySettings: getFallbackCommunitySettingsSummary("尚未加载社群配置。"),
     passwordStatus: {
       configured: false,
@@ -1899,10 +1900,11 @@ async function readAdminSummary(): Promise<AdminSummary> {
   if (!supabase) {
     const dashboard = await getDashboardData();
     const adminDashboard = toAdminDashboardData(dashboard, dashboard.rawOffers.length);
-    const [officialPrices, apiModels, apiTransit, communitySettings, passwordStatus] = await Promise.all([
+    const [officialPrices, apiModels, apiTransit, outboundAnalytics, communitySettings, passwordStatus] = await Promise.all([
       getOfficialSubscriptionAdminData(),
       getApiModelAdminData(),
       getApiTransitAdminData({ isAuthenticated: true }),
+      getOutboundAnalyticsSummary(),
       getCommunitySettingsSummary(),
       getAdminPasswordStatus(),
     ]);
@@ -1929,6 +1931,7 @@ async function readAdminSummary(): Promise<AdminSummary> {
       feedbackRawOffers: [],
       riskReviewSettings: getFallbackRiskReviewSettingsSummary(),
       sponsorSettings: getFallbackSponsorSettingsSummary(),
+      outboundAnalytics,
       communitySettings,
       passwordStatus,
     };
@@ -1954,6 +1957,7 @@ async function readAdminSummary(): Promise<AdminSummary> {
     apiTransit,
     riskReviewSettings,
     sponsorSettings,
+    outboundAnalytics,
     communitySettings,
     passwordStatus,
   ] = await Promise.all([
@@ -2004,6 +2008,7 @@ async function readAdminSummary(): Promise<AdminSummary> {
     adminLoad("api-transit", "中转 API", getApiTransitAdminData({ isAuthenticated: true }), getEmptyApiTransitAdminData(true, "读取中转 API 后台数据失败。"), loadErrors),
     adminLoad("risk-review-settings", "风险预审配置", getRiskReviewSettingsSummary(), getFallbackRiskReviewSettingsSummary(), loadErrors),
     adminLoad("sponsor-settings", "赞助位配置", getSponsorSettingsSummary(), getFallbackSponsorSettingsSummary(), loadErrors),
+    adminLoad("outbound-analytics", "数据分析", getOutboundAnalyticsSummary(), getEmptyOutboundAnalyticsSummary("读取点击归因数据失败。"), loadErrors),
     adminLoad("community-settings", "社群配置", getCommunitySettingsSummary(), getFallbackCommunitySettingsSummary(), loadErrors),
     adminLoad("admin-password", "后台密码状态", getAdminPasswordStatus(), {
       configured: false,
@@ -2101,6 +2106,7 @@ async function readAdminSummary(): Promise<AdminSummary> {
       feedbackRawOffers,
       riskReviewSettings,
       sponsorSettings,
+      outboundAnalytics,
       communitySettings,
       passwordStatus,
     };
@@ -2129,6 +2135,7 @@ async function readAdminSummary(): Promise<AdminSummary> {
     feedbackRawOffers,
     riskReviewSettings,
     sponsorSettings,
+    outboundAnalytics,
     communitySettings,
     passwordStatus,
   };
@@ -3817,7 +3824,7 @@ function buildSampleFrontRankOfferCounts(offers: RawOffer[]): Map<string, number
     const productId =
       offer.canonicalProductId ||
       offer.storedCanonicalProductId ||
-      classifyOffer(offer.sourceTitle, { tags: offer.tags, price: offer.price }).id;
+      classifyOffer(offer.sourceTitle, { tags: offer.tags }).id;
     const rows = byProduct.get(productId) || [];
     rows.push(offer);
     byProduct.set(productId, rows);
@@ -4756,7 +4763,7 @@ export async function listPublicProductOffers(id: string, filters: ProductOfferL
   const nextValue = sanitizePublicProductOffersResultForProduct(filterProductId, preferStaleProductOffers(staleValue, value));
   if (!nextValue.degraded) {
     productOffersCache.set(cacheKey, {
-      expiresAt: Date.now() + PRODUCT_OFFERS_CACHE_TTL_MS,
+      expiresAt: Date.now() + priceDataCacheTtlMsForProduct(filterProductId),
       value: nextValue,
     });
   }
@@ -5049,7 +5056,7 @@ async function getPublicProductOfferFilterFacetsFromDatabase(id: string, filterP
 
   const facets = filterOfferFilterFacetsForProduct(filterProductId, buildOfferFilterFacetsFromCounts(counts));
   productOfferFacetsCache.set(cacheKey, {
-    expiresAt: Date.now() + PRODUCT_OFFERS_CACHE_TTL_MS,
+    expiresAt: Date.now() + priceDataCacheTtlMsForProduct(filterProductId),
     value: facets,
   });
   if (productOfferFacetsCache.size > 120) {
@@ -5085,7 +5092,9 @@ function sanitizePublicProductOffersResultForProduct(
 
   const filterFacets = filterOfferFilterFacetsForProduct(productId, result.filterFacets);
   const activeFilterTags = parseOfferFilterTagsForProduct(productId, result.activeFilterTags);
-  const offers = result.offers.filter((offer) => (offer.canonicalProductId || offer.storedCanonicalProductId) === productId);
+  const offers = result.offers
+    .map(withInferredMerchantShopUrl)
+    .filter((offer) => (offer.canonicalProductId || offer.storedCanonicalProductId) === productId);
   const removedOfferCount = result.offers.length - offers.length;
   const total = removedOfferCount > 0 ? Math.max(0, result.total - removedOfferCount) : result.total;
 
@@ -6328,6 +6337,7 @@ function compactPublicOffer(offer: RawOffer): RawOffer {
     currency: offer.currency,
     status: offer.status,
     url: offer.url,
+    shopUrl: withInferredMerchantShopUrl(offer).shopUrl,
     tags: [],
     filterTags: offer.filterTags,
     stockCount: offer.stockCount,
@@ -6341,6 +6351,20 @@ function compactPublicOffer(offer: RawOffer): RawOffer {
     effectiveStatus: offer.effectiveStatus,
     freshnessStatus: offer.freshnessStatus,
     riskFeedback: offer.riskFeedback,
+  };
+}
+
+function withInferredMerchantShopUrl(offer: RawOffer): RawOffer {
+  if (offer.shopUrl !== undefined) return offer;
+
+  return {
+    ...offer,
+    shopUrl: inferMerchantShopUrl({
+      sourceId: offer.sourceId,
+      sourceName: offer.sourceName,
+      entryUrl: offer.url,
+      host: offerHost(offer.url),
+    }),
   };
 }
 
@@ -6882,6 +6906,9 @@ function normalizeSourceCollectorKind(value: unknown): Source["collectorKind"] {
 
 export function mapRawOffer(row: Record<string, unknown>): RawOffer {
   const sourceTitle = String(row.source_title || "");
+  const sourceId = row.source_id ? String(row.source_id) : null;
+  const sourceName = String(row.source_name || "");
+  const url = String(row.url || "");
   const tags = Array.isArray(row.tags) ? row.tags.map(String) : [];
   const price = row.price === null || row.price === undefined ? null : Number(row.price);
   const storedCanonicalProductId = row.canonical_product_id ? String(row.canonical_product_id) : null;
@@ -6889,14 +6916,13 @@ export function mapRawOffer(row: Record<string, unknown>): RawOffer {
   const classified = classifyOffer(sourceTitle, {
     tags,
     categorySlug: storedCategorySlug,
-    price,
   });
   const filterTags = deriveOfferFilterTags({ sourceTitle, tags });
 
   return {
     id: String(row.id),
-    sourceId: row.source_id ? String(row.source_id) : null,
-    sourceName: String(row.source_name || ""),
+    sourceId,
+    sourceName,
     sourceStoreName: row.source_store_name ? String(row.source_store_name) : null,
     collectorKind: normalizeSourceCollectorKind(row.collector_kind),
     sourceTitle,
@@ -6906,7 +6932,13 @@ export function mapRawOffer(row: Record<string, unknown>): RawOffer {
     priceBasis: row.price_basis ? String(row.price_basis) as RawOffer["priceBasis"] : null,
     currency: String(row.currency || "CNY"),
     status: String(row.status || "unknown") as RawOffer["status"],
-    url: String(row.url || ""),
+    url,
+    shopUrl: inferMerchantShopUrl({
+      sourceId,
+      sourceName,
+      entryUrl: url,
+      host: offerHost(url),
+    }),
     tags,
     filterTags,
     stockCount: row.stock_count === null || row.stock_count === undefined ? null : Number(row.stock_count),

@@ -205,6 +205,7 @@ function getTransitModelPriority(model: TransitModelPrice["standardModel"]): num
   if (model === "Grok 4.5") return 503;
   if (model === "Grok Build") return 502.5;
   if (model === "Composer 2.5") return 502;
+  if (model === "Claude Opus 5") return 511;
   if (model === "Claude Fable 5") return 510;
   if (model === "Claude Sonnet 5") return 500;
   if (model === "Claude Opus 4.8") return 408;
@@ -277,6 +278,16 @@ const TRANSIT_OFFICIAL_MODEL_PRICES: Record<
   TransitModelPrice["standardModel"],
   TransitOfficialModelPrice
 > = {
+  "Claude Opus 5": {
+    input: 5,
+    output: 25,
+    cacheWrite: 6.25,
+    cacheRead: 0.5,
+    imageOutput: null,
+    currency: "USD",
+    sourceLabel: "Anthropic API",
+    sourceUrl: anthropicPricingUrl,
+  },
   "Claude Fable 5": {
     input: 10,
     output: 50,
@@ -744,11 +755,25 @@ export function getPreferredTransitAvailabilityRollupPrices(
   prices: TransitModelPrice[],
   rankingScope: TransitAvailabilityRankingScope = "offer"
 ): TransitModelPrice[] {
-  const availabilityPrices = getTransitAvailabilityRollupPrices(station, prices);
+  const pricesWithEvidence = prices.filter((price) => hasValidTransitAvailabilityEvidence(price.availability));
+  const availabilityPrices = getTransitAvailabilityRollupPrices(
+    station,
+    pricesWithEvidence.length ? pricesWithEvidence : prices
+  );
   const directEvidence = availabilityPrices.filter(
     (price) => !isTransitAvailabilityReferenceForRankingScope(price.availability, rankingScope)
   );
   return directEvidence.length ? directEvidence : availabilityPrices;
+}
+
+function hasValidTransitAvailabilityEvidence(
+  availability: Pick<TransitAvailability, "sevenDayRate" | "sevenDaySamples">
+): boolean {
+  return (
+    availability.sevenDayRate !== null &&
+    Number.isFinite(availability.sevenDayRate) &&
+    availability.sevenDaySamples > 0
+  );
 }
 
 export type TransitAvailabilityRankingScope = "station" | "family" | "model" | "offer";
@@ -882,6 +907,88 @@ export type TransitAvailabilityRollup = Pick<
 };
 
 export type TransitAvailabilityBarTone = "good" | "warn" | "bad" | "empty";
+
+export type TransitAvailabilityFreshnessState = "fresh" | "delayed" | "stale" | "empty";
+
+export type TransitAvailabilityPresentation = {
+  availability: TransitAvailabilityRollup;
+  freshness: TransitAvailabilityFreshnessState;
+  replacedPublicEvidence: TransitAvailabilityRollup | null;
+};
+
+const TRANSIT_AVAILABILITY_DELAYED_AFTER_MS = 2 * 60 * 60 * 1000;
+const TRANSIT_AVAILABILITY_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
+
+export function getTransitAvailabilityFreshness(
+  availability: Pick<TransitAvailability, "lastCheckedAt" | "sevenDaySamples">,
+  now: string | number | Date = Date.now(),
+  station?: Pick<TransitStation, "collectionStatus" | "collectionError">,
+): TransitAvailabilityFreshnessState {
+  return getTransitEvidenceFreshness(
+    availability.lastCheckedAt,
+    availability.sevenDaySamples > 0,
+    now,
+    station,
+  );
+}
+
+function getTransitEvidenceFreshness(
+  verifiedAt: string | null | undefined,
+  hasEvidence: boolean,
+  now: string | number | Date,
+  station?: Pick<TransitStation, "collectionStatus" | "collectionError">,
+): TransitAvailabilityFreshnessState {
+  if (!hasEvidence || !verifiedAt) return "empty";
+  const checkedAt = parseAvailabilityTimestamp(verifiedAt);
+  const referenceAt = rankingTimestamp(now);
+  if (checkedAt === null || !Number.isFinite(referenceAt)) return "empty";
+
+  const age = Math.max(0, referenceAt - checkedAt);
+  if (age <= TRANSIT_AVAILABILITY_DELAYED_AFTER_MS) return "fresh";
+  if (age > TRANSIT_AVAILABILITY_STALE_AFTER_MS) return "stale";
+
+  const permanentSourceError =
+    station?.collectionStatus === "failed" && /(?:^|\D)(?:404|410)(?:\D|$)/.test(station.collectionError || "");
+  return permanentSourceError ? "stale" : "delayed";
+}
+
+export function getTransitStationAvailabilityPresentation(
+  station: TransitStation,
+  publishedAvailability: TransitAvailabilityRollup,
+  now: string | number | Date = Date.now(),
+): TransitAvailabilityPresentation {
+  const publishedFreshness = getTransitAvailabilityFreshness(publishedAvailability, now, station);
+  const probe = station.availability;
+  const probeFreshness = getTransitAvailabilityFreshness(probe, now);
+
+  if (
+    publishedFreshness !== "fresh" &&
+    publishedAvailability.sourceType !== "priceai_probe" &&
+    probe.sourceType === "priceai_probe" &&
+    probeFreshness === "fresh"
+  ) {
+    return {
+      availability: {
+        ...probe,
+        firstCheckedAt: probe.firstCheckedAt ?? null,
+        recentSamples: normalizeRecentAvailabilitySamples(
+          transitAvailabilityRecentSamples(probe) || [],
+        ),
+        latestLatencyMs: probe.latestLatencyMs ?? null,
+        avgLatency7dMs: probe.avgLatency7dMs ?? null,
+        referenceOnly: false,
+      },
+      freshness: "fresh",
+      replacedPublicEvidence: publishedAvailability,
+    };
+  }
+
+  return {
+    availability: publishedAvailability,
+    freshness: publishedFreshness,
+    replacedPublicEvidence: null,
+  };
+}
 
 export function getRecentTransitAvailabilitySamples(
   prices: TransitModelPrice[]
@@ -1662,6 +1769,49 @@ export type TransitStationRankingOptions = {
   now?: string | number | Date;
 };
 
+export type TransitPriceFreshnessSummary = {
+  state: TransitAvailabilityFreshnessState;
+  lastVerifiedAt: string | null;
+};
+
+export function getTransitStationPriceFreshness(
+  station: TransitStation,
+  options: TransitStationRankingOptions = {},
+): TransitPriceFreshnessSummary {
+  const prices = getActiveSortPrices(station, options);
+  const pricedEvidence = prices
+    .map((price) => ({
+      price,
+      value: getCombinedRateForPrice(station, price) ?? getTransitFixedPriceValue(price),
+    }))
+    .filter((entry): entry is { price: TransitModelPrice; value: number } =>
+      entry.value !== null && Number.isFinite(entry.value) && entry.value > 0
+    );
+  const bestValue = pricedEvidence.length
+    ? Math.min(...pricedEvidence.map((entry) => entry.value))
+    : null;
+  const evidencePrices = bestValue === null
+    ? prices
+    : pricedEvidence
+      .filter((entry) => entry.value === bestValue)
+      .map((entry) => entry.price);
+  const lastVerifiedAt = evidencePrices
+    .map((price) => price.lastVerifiedAt)
+    .filter(Boolean)
+    .sort()
+    .at(-1) ?? null;
+
+  return {
+    state: getTransitEvidenceFreshness(
+      lastVerifiedAt,
+      prices.length > 0,
+      options.now ?? Date.now(),
+      station,
+    ),
+    lastVerifiedAt,
+  };
+}
+
 export type TransitStationRankingBreakdown = {
   totalScore: number;
   costScore: number;
@@ -1698,6 +1848,8 @@ type TransitStationSortContext = {
   lastCheckedAt: string | null;
   latestLatencyMs: number | null;
   avgLatency7dMs: number | null;
+  freshness: TransitAvailabilityFreshnessState;
+  priceFreshness: TransitAvailabilityFreshnessState;
 };
 
 export function compareStations(
@@ -1731,7 +1883,11 @@ export function compareStations(
 
     if (sortBy === "claude_rate") {
       return (
-        compareNullableNumber(a.summary.claude.combinedRateMin, b.summary.claude.combinedRateMin, "asc") ||
+        compareNullableNumber(
+          rankableTransitFamilyRate(a, "claude", options),
+          rankableTransitFamilyRate(b, "claude", options),
+          "asc",
+        ) ||
         compareNullableNumber(a.cost, b.cost, "asc") ||
         compareNullableNumber(a.stabilityRate, b.stabilityRate, "desc") ||
         b.stabilitySamples - a.stabilitySamples ||
@@ -1741,7 +1897,11 @@ export function compareStations(
 
     if (sortBy === "gpt_rate") {
       return (
-        compareNullableNumber(a.summary.gpt.combinedRateMin, b.summary.gpt.combinedRateMin, "asc") ||
+        compareNullableNumber(
+          rankableTransitFamilyRate(a, "gpt", options),
+          rankableTransitFamilyRate(b, "gpt", options),
+          "asc",
+        ) ||
         compareNullableNumber(a.cost, b.cost, "asc") ||
         compareNullableNumber(a.stabilityRate, b.stabilityRate, "desc") ||
         b.stabilitySamples - a.stabilitySamples ||
@@ -1783,25 +1943,52 @@ function getTransitStationSortContext(
     : getStationComparisonSummary(station);
   const scope = getActiveSortScope(station, summary, options);
   const prices = getActiveSortPrices(station, options);
-  const referenceOnly = scope ? scope.referenceOnly : summary.availability.referenceOnly;
+  const now = options.now ?? Date.now();
+  const presentation = allTextScope
+    ? getTransitStationAvailabilityPresentation(station, summary.availability, now)
+    : null;
+  const rankingAvailability = presentation?.availability ?? (scope || summary.availability);
+  const referenceOnly = presentation?.availability.referenceOnly
+    ?? (scope ? scope.referenceOnly : summary.availability.referenceOnly);
+  const freshness = presentation?.freshness ?? getTransitAvailabilityFreshness(rankingAvailability, now, station);
+  const availabilityExcluded = referenceOnly || freshness === "stale" || freshness === "empty";
+  const priceFreshness = getTransitStationPriceFreshness(station, { ...options, now }).state;
+  const priceExcluded = priceFreshness === "stale" || priceFreshness === "empty";
 
   return {
     station,
     summary,
     scope,
-    cost: transitSortCost(scope, summary),
-    stabilityRate: referenceOnly ? null : scope ? scope.sevenDayRate : summary.stabilityRate,
-    stabilitySamples: referenceOnly ? 0 : scope ? scope.sevenDaySamples : summary.stabilitySamples,
-    recentSamples: referenceOnly ? undefined : scope ? scope.recentSamples : summary.availability.recentSamples,
+    cost: priceExcluded ? null : transitSortCost(scope, summary),
+    stabilityRate: availabilityExcluded ? null : rankingAvailability.sevenDayRate,
+    stabilitySamples: availabilityExcluded ? 0 : rankingAvailability.sevenDaySamples,
+    recentSamples: availabilityExcluded ? undefined : rankingAvailability.recentSamples,
     cacheUsage: getAggregatedTransitCacheUsage(prices, {
       equalWeightFamilies:
         (!options.activeFamily || options.activeFamily === "all") &&
         (!options.activeStandardModel || options.activeStandardModel === "all"),
     }),
-    lastCheckedAt: scope ? scope.lastCheckedAt : summary.availability.lastCheckedAt,
-    latestLatencyMs: (scope ? scope.latestLatencyMs : summary.availability.latestLatencyMs) ?? null,
-    avgLatency7dMs: (scope ? scope.avgLatency7dMs : summary.availability.avgLatency7dMs) ?? null,
+    lastCheckedAt: rankingAvailability.lastCheckedAt,
+    latestLatencyMs: rankingAvailability.latestLatencyMs ?? null,
+    avgLatency7dMs: rankingAvailability.avgLatency7dMs ?? null,
+    freshness,
+    priceFreshness,
   };
+}
+
+function rankableTransitFamilyRate(
+  context: TransitStationSortContext,
+  family: TransitModelFamily,
+  options: TransitStationRankingOptions,
+): number | null {
+  const priceFreshness = getTransitStationPriceFreshness(context.station, {
+    ...options,
+    activeFamily: family,
+    activeStandardModel: "all",
+  }).state;
+  return priceFreshness === "stale" || priceFreshness === "empty"
+    ? null
+    : context.summary.families[family].combinedRateMin;
 }
 
 function getActiveSortPrices(
@@ -1850,7 +2037,10 @@ function scoreTransitStationContexts(
     .filter((value): value is number => value !== null);
 
   return new Map(contexts.map((context) => {
-    const costScore = scoreTransitRelativeCost(context.cost, peerRates) * TRANSIT_RANKING_WEIGHTS.cost;
+    const priceFreshnessWeight = context.priceFreshness === "delayed" ? 0.5 : 1;
+    const costScore = scoreTransitRelativeCost(context.cost, peerRates) *
+      TRANSIT_RANKING_WEIGHTS.cost * priceFreshnessWeight;
+    const freshnessWeight = context.freshness === "delayed" ? 0.5 : 1;
     const sevenDayReliability = scoreTransitReliability(
       context.stabilityRate,
       context.stabilitySamples
@@ -1859,9 +2049,9 @@ function scoreTransitStationContexts(
       context.recentSamples,
       sevenDayReliability,
       context.stabilitySamples
-    );
+    ) * freshnessWeight;
     const recentReliabilityScore = recentReliability * TRANSIT_RANKING_WEIGHTS.recentReliability;
-    const sevenDayReliabilityScore = sevenDayReliability * TRANSIT_RANKING_WEIGHTS.sevenDayReliability;
+    const sevenDayReliabilityScore = sevenDayReliability * freshnessWeight * TRANSIT_RANKING_WEIGHTS.sevenDayReliability;
     const reliabilityScore = recentReliabilityScore + sevenDayReliabilityScore;
     const hasScoredLatency = responseLatencyEnabled && isTransitResponseLatencyEligible(context, now);
     const averageLatencyScore = hasScoredLatency
@@ -2006,9 +2196,10 @@ function scoreTransitDetectionSummary(detection: TransitModelDetectionSummary | 
 
 function isTransitRankingEligible(context: TransitStationSortContext, now: number): boolean {
   if (context.cost === null || context.stabilityRate === null || context.stabilitySamples <= 0) return false;
+  if (context.freshness === "stale" || context.freshness === "empty") return false;
   const checkedAt = parseAvailabilityTimestamp(context.lastCheckedAt);
   if (checkedAt === null) return false;
-  return Math.max(0, now - checkedAt) <= 7 * 24 * 60 * 60 * 1000;
+  return Math.max(0, now - checkedAt) <= TRANSIT_AVAILABILITY_STALE_AFTER_MS;
 }
 
 function isTransitResponseLatencyEligible(
@@ -2252,6 +2443,17 @@ export function formatRate(rate: number | null): string {
   if (rate < 0.01) return `${rate.toFixed(4)}x`;
   if (rate < 0.1) return `${rate.toFixed(3)}x`;
   return `${rate.toFixed(2)}x`;
+}
+
+export function isDollarTransitModelFamily(family: TransitModelFamily): boolean {
+  return family === "gpt" || family === "claude" || family === "gemini" || family === "grok";
+}
+
+export function formatYuanPerDollar(rate: number | null): string {
+  if (rate === null || !Number.isFinite(rate)) return "—";
+  const decimals = rate < 0.1 ? 3 : 2;
+  const value = rate.toFixed(decimals).replace(/\.?0+$/, "");
+  return `¥${value} / 刀`;
 }
 
 export function formatTransitModelMultiplier(price: TransitModelPrice): string {
@@ -2676,10 +2878,21 @@ export function formatAvailability(
 export type AvailabilitySourceTone = "success" | "info" | "warning" | "muted";
 
 export function getAvailabilityEvidenceMeta(
-  availability: Pick<TransitAvailability, "scope" | "matchLevel" | "note" | "sourceType">
+  availability: Pick<
+    TransitAvailability,
+    "scope" | "matchLevel" | "note" | "sourceType" | "sevenDayRate" | "sevenDaySamples"
+  >
 ): { label: string; tone: AvailabilitySourceTone; title: string; reference: boolean } {
   const scope = getTransitAvailabilityScope(availability);
   const matchLevel = getTransitAvailabilityMatchLevel(availability);
+  if (!hasValidTransitAvailabilityEvidence(availability)) {
+    return {
+      label: "监测样本不足",
+      tone: "muted",
+      title: "当前记录没有可用于展示的成功率和监测样本。",
+      reference: false,
+    };
+  }
   if (matchLevel === "family") {
     return {
       label: "同家族参考",

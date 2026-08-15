@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { ArrowUpDown, ChevronRight, Filter, ShieldCheck } from "lucide-react";
+import { AlertTriangle, ArrowUpDown, ChevronRight, Filter, ShieldCheck } from "lucide-react";
 import {
   DataTableHead,
   DataTableShell,
@@ -17,6 +17,7 @@ import { TransitLatencyBadge } from "@/components/TransitLatencyBadge";
 import { TransitStationSystemIcon } from "@/components/TransitStationSystemIcon";
 import { TransitViewTabs } from "@/components/TransitViewTabs";
 import { useDebouncedValue } from "@/lib/client-hooks";
+import { replaceClientSearchParams, useClientSearchParams } from "@/lib/client-url-state";
 import { listDetailNavigationHref, shouldHandleListDetailClick } from "@/lib/list-return";
 import { saveCurrentListScrollPosition, useListScrollRestoration } from "@/lib/list-scroll-restoration";
 import { formatDateMinute, formatDateShortMinute } from "@/lib/utils";
@@ -69,15 +70,20 @@ import {
   getStationComparisonSummary,
   getTextStationComparisonSummary,
   getStationPublishedAvailabilitySummary,
+  getTransitAvailabilityFreshness,
+  getTransitStationAvailabilityPresentation,
+  getTransitStationPriceFreshness,
   getStationRechargeCoefficient,
   getTransitModelDetectionBadgeClass,
   getTransitPriceDetectionSummary,
   getTransitStationDetectionSummary,
   hasPublicTransitModelDetectionReport,
   hasTransitAffRelation,
+  isDollarTransitModelFamily,
   getTransitReviewTags,
   getTransitStationSystemLabel,
   formatTransitFixedPriceRange,
+  formatYuanPerDollar,
   hasTransitFixedPriceSummary,
   parseRechargeRatio,
   type TransitSortKey,
@@ -141,7 +147,8 @@ interface Props {
 export default function TransitStationExplorer({ stations, rankingReferenceAt }: Props) {
   useListScrollRestoration();
   const router = useRouter();
-  const searchParams = useSearchParams();
+  const routeSearchParams = useSearchParams();
+  const searchParams = useClientSearchParams(routeSearchParams.toString());
   const [urlReady, setUrlReady] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
   const [search, setSearch] = useState(searchParams.get("q") || "");
@@ -177,22 +184,13 @@ export default function TransitStationExplorer({ stations, rankingReferenceAt }:
   useEffect(() => {
     if (!urlReady) return;
 
-    const params = new URLSearchParams();
-    if (debouncedSearch) params.set("q", debouncedSearch);
-    if (modelFilter !== "all") params.set("model", modelFilter);
-    if (familyFilter !== "all") params.set("family", familyFilter);
-    if (channelFilter !== "all") params.set("channel", channelFilter);
-    if (poolFilter !== "all") params.set("pool", poolFilter);
-    if (sortBy !== "overall") params.set("sort", sortBy);
-
-    const query = params.toString();
-    const nextUrl = query ? `/api-transit?${query}` : "/api-transit";
-    const currentUrl = `${window.location.pathname}${window.location.search}`;
-
-    if (currentUrl === nextUrl) return;
-
-    window.history.replaceState(null, "", nextUrl);
-  }, [channelFilter, debouncedSearch, familyFilter, modelFilter, poolFilter, sortBy, urlReady]);
+    replaceClientSearchParams("/api-transit", {
+      q: debouncedSearch || null,
+      channel: channelFilter === "all" ? null : channelFilter,
+      pool: poolFilter === "all" ? null : poolFilter,
+      sort: sortBy === "overall" ? null : sortBy,
+    });
+  }, [channelFilter, debouncedSearch, poolFilter, sortBy, urlReady]);
 
   const filtered = useMemo(() => {
     let result = [...stations];
@@ -396,7 +394,7 @@ export default function TransitStationExplorer({ stations, rankingReferenceAt }:
                     <DataTableHead explanation={availabilityColumnExplanation}>稳定性</DataTableHead>
                     <DataTableHead explanation="模型真实性检测报告：用于识别模型掺水、暗调路由、私下替换等风险；无公开报告时只显示待检测。">模型检测</DataTableHead>
                     <DataTableHead explanation="公开披露或 PriceAI 推断的上游来源与号池类型，用于判断风险边界。">来源渠道</DataTableHead>
-                    <DataTableHead>更新时间</DataTableHead>
+                    <DataTableHead explanation="价格数据的最近更新时间；若站方同步失败，会单独显示最近检查时间。">价格更新</DataTableHead>
                     <DataTableHead className="w-[120px] text-center">操作</DataTableHead>
                   </tr>
                 </thead>
@@ -408,6 +406,7 @@ export default function TransitStationExplorer({ stations, rankingReferenceAt }:
                       href={stationDetailHref(station.slug)}
                       activeFamily={effectiveFamilyFilter}
                       activeStandardModel={modelFilter}
+                      rankingReferenceAt={rankingReferenceAt}
                       onClick={navigateToStation}
                       onWarm={() => prefetchStation(station.slug)}
                     />
@@ -424,6 +423,7 @@ export default function TransitStationExplorer({ stations, rankingReferenceAt }:
                 href={stationDetailHref(station.slug)}
                 activeFamily={effectiveFamilyFilter}
                 activeStandardModel={modelFilter}
+                rankingReferenceAt={rankingReferenceAt}
                 rateLabel={rateColumnLabel}
                 onClick={navigateToStation}
                 onWarm={() => prefetchStation(station.slug)}
@@ -459,7 +459,7 @@ function RechargeRatioDisplay({ station }: { station: TransitStation }) {
     >
       <span className="font-extrabold text-[#2d3435]">{formatRate(coefficient)}</span>
       <span className="text-[#9aa2a3]">·</span>
-      <span className="text-[10px] font-bold text-[#47657a]">{ratioText}</span>
+      <span className="text-[10px] font-bold text-[#47657a]">{formatRechargeRatioSymbol(ratioText)}</span>
     </span>
   );
 }
@@ -468,6 +468,14 @@ function getDisplayRechargeRatio(text: string | null): string | null {
   if (!text) return null;
   const match = text.match(/\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?/);
   return match?.[0]?.replace(/\s+/g, "") ?? null;
+}
+
+function formatRechargeRatioSymbol(displayRatio: string): string {
+  const quota = parseRechargeRatio(displayRatio);
+  if (quota === null || !Number.isFinite(quota)) return displayRatio;
+  const decimals = quota >= 100 ? 0 : quota >= 10 ? 1 : 2;
+  const quotaText = quota.toFixed(decimals).replace(/\.?0+$/, "");
+  return `¥1 = ${quotaText}刀`;
 }
 
 function rechargeRatioTitle(originalText: string | null, displayRatio: string): string {
@@ -483,11 +491,13 @@ function CombinedRateCell({
   station,
   family,
   standardModel = "all",
+  rankingReferenceAt,
   compact = false,
 }: {
   station: TransitStation;
   family: "all" | TransitModelFamily;
   standardModel?: "all" | TransitStandardModel;
+  rankingReferenceAt: string;
   compact?: boolean;
 }) {
   const comparison = family === "all" && standardModel === "all"
@@ -502,6 +512,31 @@ function CombinedRateCell({
   const fixedPrice = summary && hasTransitFixedPriceSummary(summary)
     ? formatTransitFixedPriceRange(summary)
     : null;
+  const bestSummary = family === "all" && standardModel === "all"
+    ? TRANSIT_TEXT_MODEL_FAMILY_ORDER
+      .map((modelFamily) => comparison.families[modelFamily])
+      .filter((item) => item.combinedRateMin !== null)
+      .sort((left, right) => (left.combinedRateMin ?? Infinity) - (right.combinedRateMin ?? Infinity))[0] ?? null
+    : null;
+  const yuanSummary = summary ?? bestSummary;
+  const showYuanPerDollar = yuanSummary !== null &&
+    !fixedPrice &&
+    isDollarTransitModelFamily(yuanSummary.family) &&
+    (standardModel === "all" || TRANSIT_STANDARD_MODEL_MODALITY[standardModel] === "text");
+  const yuanPerDollarLabel = showYuanPerDollar ? formatYuanPerDollar(rate) : null;
+  const secondaryLabel = fixedPrice
+    ? "人民币固定价"
+    : standardModel !== "all"
+      ? standardModel
+      : summary
+        ? formatMultiplierRange(summary)
+        : bestFamilyLabel(comparison);
+  const priceFreshness = getTransitStationPriceFreshness(station, {
+    activeFamily: family,
+    activeStandardModel: standardModel,
+    now: rankingReferenceAt,
+  });
+  const historicalValue = fixedPrice || formatRate(rate);
 
   if (summary && summary.priceCount === 0) {
     return <span className="text-xs text-[#7f8889]">未收录</span>;
@@ -511,13 +546,39 @@ function CombinedRateCell({
     return <span className="text-xs text-[#7f8889]">暂无价格</span>;
   }
 
+  if (priceFreshness.state === "stale" || priceFreshness.state === "empty") {
+    return (
+      <div className={compact ? "min-w-0" : "min-w-[108px]"}>
+        <div className="flex items-center gap-1 text-[11px] font-bold text-[#9a5d12]">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          <span>暂无近期价格</span>
+        </div>
+        <div className="mt-1 text-[10px] font-semibold leading-4 text-[#7f8889]">
+          历史 {historicalValue}
+          {priceFreshness.lastVerifiedAt ? ` · ${formatDateShortMinute(priceFreshness.lastVerifiedAt)}` : ""}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={compact ? "" : "min-w-[108px]"}>
-      <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-extrabold ${getRateBadgeClass(rate)}`}>
+      <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-extrabold ${
+        priceFreshness.state === "delayed"
+          ? "bg-[#fff7e8] text-[#7a541b]"
+          : getRateBadgeClass(rate)
+      }`}>
         {fixedPrice || formatRate(rate)}
       </span>
-      <div className="mt-1 text-[10px] font-semibold text-[#7f8889]">
-        {fixedPrice ? "人民币固定价" : standardModel !== "all" ? standardModel : summary ? formatMultiplierRange(summary) : bestFamilyLabel(comparison)}
+      <div className={`mt-1 text-[10px] font-semibold ${priceFreshness.state === "delayed" ? "text-[#9a5d12]" : "text-[#7f8889]"}`}>
+        {priceFreshness.state === "delayed" ? (
+          `价格待更新${priceFreshness.lastVerifiedAt ? ` · ${formatDateShortMinute(priceFreshness.lastVerifiedAt)}` : ""}`
+        ) : (
+          <>
+            <div>{secondaryLabel}</div>
+            {yuanPerDollarLabel ? <div className="mt-0.5">{yuanPerDollarLabel}</div> : null}
+          </>
+        )}
       </div>
     </div>
   );
@@ -527,11 +588,13 @@ function PriceBreakdownCell({
   station,
   activeFamily,
   activeStandardModel = "all",
+  rankingReferenceAt,
   compact = false,
 }: {
   station: TransitStation;
   activeFamily: "all" | TransitModelFamily;
   activeStandardModel?: "all" | TransitStandardModel;
+  rankingReferenceAt: string;
   compact?: boolean;
 }) {
   const summary = activeFamily === "all" && activeStandardModel === "all"
@@ -545,9 +608,22 @@ function PriceBreakdownCell({
       .filter((item) => item.priceCount > 0 && (activeFamily === "all" || item.family === activeFamily))
       .slice(0, compact ? 3 : 4);
   const fixedPriceOnly = visibleSummaries.length > 0 && visibleSummaries.every(hasTransitFixedPriceSummary);
+  const priceFreshness = getTransitStationPriceFreshness(station, {
+    activeFamily,
+    activeStandardModel,
+    now: rankingReferenceAt,
+  });
+  const historical = priceFreshness.state === "stale" || priceFreshness.state === "empty";
+  const delayed = priceFreshness.state === "delayed";
 
   return (
     <div className={compact ? "space-y-1" : "min-w-[166px] space-y-1"}>
+      {historical || delayed ? (
+        <div className="flex items-center gap-1 text-[10px] font-bold text-[#9a5d12]">
+          <AlertTriangle className="h-3 w-3 shrink-0" aria-hidden="true" />
+          <span>{historical ? "以下为历史倍率" : "倍率待更新"}</span>
+        </div>
+      ) : null}
       <div className="flex items-center gap-1.5 text-[11px] font-semibold">
         <span className="shrink-0 text-[10px] font-extrabold text-[#7f8889]">充值倍率</span>
         <RechargeRatioDisplay station={station} />
@@ -564,6 +640,7 @@ function PriceBreakdownCell({
                 label={activeStandardModel !== "all" ? "模型" : TRANSIT_MODEL_FAMILY_LABELS[item.family]}
                 value={hasTransitFixedPriceSummary(item) ? formatTransitFixedPriceRange(item) : formatMultiplierRange(item)}
                 missing={false}
+                historical={historical || delayed}
               />
             ))
           ) : (
@@ -576,7 +653,11 @@ function PriceBreakdownCell({
           缓存命中率
         </span>
         <span
-          className={`rounded-full px-2 py-0.5 tabular-nums ${fixedPriceOnly ? "bg-[#f2f4f4] text-[#7f8889]" : getCacheHitRateBadgeClass(cacheUsage)}`}
+          className={`rounded-full px-2 py-0.5 tabular-nums ${
+            historical || delayed || fixedPriceOnly
+              ? "bg-[#f2f4f4] text-[#7f8889]"
+              : getCacheHitRateBadgeClass(cacheUsage)
+          }`}
           title={TRANSIT_CACHE_HIT_RATE_EXPLANATION}
         >
           {fixedPriceOnly ? "不适用" : formatCacheHitRate(cacheUsage)}
@@ -610,9 +691,21 @@ function bestFamilyLabel(summary: ReturnType<typeof getStationComparisonSummary>
   return best ? `${TRANSIT_MODEL_FAMILY_LABELS[best.family]} 最低` : "全模型";
 }
 
-function CompactRateTag({ label, value, missing }: { label: string; value: string; missing: boolean }) {
+function CompactRateTag({
+  label,
+  value,
+  missing,
+  historical = false,
+}: {
+  label: string;
+  value: string;
+  missing: boolean;
+  historical?: boolean;
+}) {
   return (
-    <span className={`rounded-full px-2 py-0.5 ${missing ? "bg-[#f2f4f4] text-[#7f8889]" : "bg-[#fff7e8] text-[#7a541b]"}`}>
+    <span className={`rounded-full px-2 py-0.5 ${
+      missing || historical ? "bg-[#f2f4f4] text-[#7f8889]" : "bg-[#fff7e8] text-[#7a541b]"
+    }`}>
       {label} {missing ? "未收录" : value}
     </span>
   );
@@ -623,6 +716,7 @@ function StationRow({
   href,
   activeFamily,
   activeStandardModel,
+  rankingReferenceAt,
   onClick,
   onWarm,
 }: {
@@ -630,6 +724,7 @@ function StationRow({
   href: string;
   activeFamily: "all" | TransitModelFamily;
   activeStandardModel: "all" | TransitStandardModel;
+  rankingReferenceAt: string;
   onClick: (href: string) => void;
   onWarm: () => void;
 }) {
@@ -655,17 +750,28 @@ function StationRow({
         <StationIdentity station={station} />
       </td>
       <td className="px-5 py-4">
-        <CombinedRateCell station={station} family={activeFamily} standardModel={activeStandardModel} />
+        <CombinedRateCell
+          station={station}
+          family={activeFamily}
+          standardModel={activeStandardModel}
+          rankingReferenceAt={rankingReferenceAt}
+        />
       </td>
       <td className="px-5 py-4">
         <PriceBreakdownCell
           station={station}
           activeFamily={activeFamily}
           activeStandardModel={activeStandardModel}
+          rankingReferenceAt={rankingReferenceAt}
         />
       </td>
       <td className="px-5 py-4">
-        <AvailabilityCell station={station} activeFamily={activeFamily} activeStandardModel={activeStandardModel} />
+        <AvailabilityCell
+          station={station}
+          activeFamily={activeFamily}
+          activeStandardModel={activeStandardModel}
+          rankingReferenceAt={rankingReferenceAt}
+        />
       </td>
       <td className="px-5 py-4">
         <ModelDetectionCell
@@ -705,6 +811,7 @@ function StationCard({
   href,
   activeFamily,
   activeStandardModel,
+  rankingReferenceAt,
   rateLabel,
   onClick,
   onWarm,
@@ -713,6 +820,7 @@ function StationCard({
   href: string;
   activeFamily: "all" | TransitModelFamily;
   activeStandardModel: "all" | TransitStandardModel;
+  rankingReferenceAt: string;
   rateLabel: string;
   onClick: (href: string) => void;
   onWarm: () => void;
@@ -747,13 +855,20 @@ function StationCard({
         <div className="min-w-0">
           <p className="text-[10px] font-bold leading-4 text-[#5a6061]">{rateLabel}</p>
           <div className="mt-1.5">
-            <CombinedRateCell station={station} family={activeFamily} standardModel={activeStandardModel} compact />
+            <CombinedRateCell
+              station={station}
+              family={activeFamily}
+              standardModel={activeStandardModel}
+              rankingReferenceAt={rankingReferenceAt}
+              compact
+            />
           </div>
         </div>
         <AvailabilityCell
           station={station}
           activeFamily={activeFamily}
           activeStandardModel={activeStandardModel}
+          rankingReferenceAt={rankingReferenceAt}
           compact
         />
       </div>
@@ -762,9 +877,7 @@ function StationCard({
         <div className="min-w-0 overflow-hidden">
           <PillList items={sourceTags} max={2} />
         </div>
-        <span className="shrink-0 text-[0.68rem] text-[#5a6061]">
-          {formatDateShortMinute(station.lastUpdatedAt)}
-        </span>
+        <UpdatedAtCell station={station} compact />
       </div>
     </div>
   );
@@ -774,11 +887,13 @@ function AvailabilityCell({
   station,
   activeFamily,
   activeStandardModel = "all",
+  rankingReferenceAt,
   compact = false,
 }: {
   station: TransitStation;
   activeFamily: "all" | TransitModelFamily;
   activeStandardModel?: "all" | TransitStandardModel;
+  rankingReferenceAt: string;
   compact?: boolean;
 }) {
   const scopedSummary = activeStandardModel !== "all"
@@ -790,12 +905,19 @@ function AvailabilityCell({
     ? getTextStationComparisonSummary(station)
     : null;
   const stationAvailability = textSummary?.availability ?? getStationPublishedAvailabilitySummary(station);
-  const availability = scopedSummary || stationAvailability;
+  const presentation = scopedSummary
+    ? null
+    : getTransitStationAvailabilityPresentation(station, stationAvailability, rankingReferenceAt);
+  const availability = scopedSummary || presentation?.availability || stationAvailability;
+  const freshness = presentation?.freshness
+    ?? getTransitAvailabilityFreshness(availability, rankingReferenceAt, station);
+  const isHistorical = freshness === "stale" || freshness === "empty";
+  const isDelayed = freshness === "delayed";
   const source = activeStandardModel !== "all"
     ? getStandardModelAvailabilitySourceMeta(station, activeStandardModel)
     : scopedSummary
       ? getFamilyAvailabilitySourceMeta(station, scopedSummary.family)
-      : getAvailabilitySourceMeta(stationAvailability);
+      : getAvailabilitySourceMeta(presentation?.availability ?? stationAvailability);
   const scopeLabel = activeStandardModel !== "all"
     ? `${activeStandardModel} 稳定性`
     : scopedSummary
@@ -806,40 +928,67 @@ function AvailabilityCell({
     : scopedSummary
       ? `${scopedSummary.familyLabel} 分组近 7 日可用性样本；最近样本只使用同模型、同分组或同家族的兼容监测范围。`
     : "仅按当前公开文本模型分组汇总的近 7 日可用性样本；图片和视频不参与综合排序。";
-  const hasLatencySummary = availability.latestLatencyMs !== null && availability.latestLatencyMs !== undefined
-    || availability.avgLatency7dMs !== null && availability.avgLatency7dMs !== undefined;
+  const hasLatencySummary = !isHistorical && (
+    (availability.latestLatencyMs !== null && availability.latestLatencyMs !== undefined) ||
+    (availability.avgLatency7dMs !== null && availability.avgLatency7dMs !== undefined)
+  );
   const title = hasLatencySummary
     ? `${sourceTitle} 响应延迟表示公开监测或 PriceAI 实测的请求耗时，不等同于首 Token 时间或 TPS 输出速度。`
     : sourceTitle;
 
   return (
     <div className={compact ? "" : "min-w-[118px]"} title={title}>
-      {compact ? (
+      {isHistorical ? (
+        <>
+          <div className="flex items-center gap-1.5 text-[11px] font-bold text-[#9a5d12]">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            <span>{freshness === "empty" ? "暂无监测数据" : "暂无近期监测"}</span>
+          </div>
+          {availability.sevenDaySamples > 0 ? (
+            <div className="mt-0.5 text-[10px] font-semibold text-[#7f8889]">
+              历史 {formatAvailability(availability)}
+            </div>
+          ) : null}
+        </>
+      ) : compact ? (
         <div className="mb-1 text-xs font-semibold text-[#5a6061]">
-          {scopeLabel} <span className="text-[#202829]">{formatAvailability(availability)}</span>
+          {isDelayed ? "监测延迟" : scopeLabel} <span className={isDelayed ? "text-[#9a5d12]" : "text-[#202829]"}>{formatAvailability(availability)}</span>
         </div>
       ) : (
         <>
-          <div className="text-[10px] font-bold text-[#7f8889]">{scopeLabel}</div>
+          <div className={`text-[10px] font-bold ${isDelayed ? "text-[#9a5d12]" : "text-[#7f8889]"}`}>
+            {isDelayed ? "监测延迟" : scopeLabel}
+          </div>
           <div className="mt-0.5 text-xs font-semibold text-[#202829]">{formatAvailability(availability)}</div>
         </>
       )}
-      <TransitAvailabilityStrip
-        rate={availability.sevenDayRate}
-        samples={availability.sevenDaySamples}
-        firstCheckedAt={availability.firstCheckedAt}
-        lastCheckedAt={availability.lastCheckedAt}
-        recentSamples={availability.recentSamples}
-        className="mt-1"
-      />
+      {isHistorical ? (
+        <HistoricalAvailabilityStrip className="mt-1" />
+      ) : (
+        <TransitAvailabilityStrip
+          rate={availability.sevenDayRate}
+          samples={availability.sevenDaySamples}
+          firstCheckedAt={availability.firstCheckedAt}
+          lastCheckedAt={availability.lastCheckedAt}
+          recentSamples={availability.recentSamples}
+          className="mt-1"
+        />
+      )}
       <div className="mt-1 flex min-w-0 items-center gap-1.5 whitespace-nowrap text-[10px] text-[#7f8889]">
-        <span>{formatDateShortMinute(availability.lastCheckedAt)}</span>
+        <span>{availability.lastCheckedAt ? `${isHistorical || isDelayed ? "最后监测 " : ""}${formatDateShortMinute(availability.lastCheckedAt)}` : "未记录监测时间"}</span>
         <AvailabilitySourceBadge
           source={source}
           compact={compact}
           hidden={!shouldShowAvailabilitySourceBadge(availability, source)}
         />
       </div>
+      {presentation?.replacedPublicEvidence ? (
+        <div className="mt-1 text-[10px] font-semibold leading-4 text-[#9a5d12]">
+          站方公开监测已中断，当前为 PriceAI 实测
+        </div>
+      ) : station.collectionStatus === "failed" && (isHistorical || isDelayed) ? (
+        <div className="mt-1 text-[10px] font-semibold leading-4 text-[#9a5d12]">站方同步失败</div>
+      ) : null}
       {hasLatencySummary ? (
         <div className="mt-1">
           <TransitLatencyBadge
@@ -850,6 +999,23 @@ function AvailabilityCell({
           />
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function HistoricalAvailabilityStrip({ className = "" }: { className?: string }) {
+  return (
+    <div
+      className={`flex h-4 items-end gap-[2px] ${className}`}
+      role="img"
+      aria-label="最近没有可用的监测样本"
+    >
+      {Array.from({ length: 20 }, (_, index) => (
+        <span
+          key={index}
+          className="h-2.5 min-w-[3px] flex-1 rounded-[1px] bg-[#dfe4e4]"
+        />
+      ))}
     </div>
   );
 }
@@ -992,14 +1158,30 @@ function shouldShowAvailabilitySourceBadge(
   return availability.sevenDaySamples > 0 || source.tone !== "muted" || Boolean(source.url);
 }
 
-function UpdatedAtCell({ station }: { station: TransitStation }) {
+function UpdatedAtCell({ station, compact = false }: { station: TransitStation; compact?: boolean }) {
+  const failed = station.collectionStatus === "failed";
+  const checkedAt = station.lastCollectedAt || station.lastUpdatedAt;
+  if (compact) {
+    return (
+      <span
+        className={`shrink-0 text-[0.68rem] font-semibold ${failed ? "text-[#9a5d12]" : "text-[#5a6061]"}`}
+        title={failed ? `最近检查 ${formatDateMinute(checkedAt)} · 同步失败` : `价格更新 ${formatDateMinute(station.lastUpdatedAt)}`}
+      >
+        {failed ? `检查 ${formatDateShortMinute(checkedAt)} · 失败` : formatDateShortMinute(station.lastUpdatedAt)}
+      </span>
+    );
+  }
+
   return (
-    <span
-      className="inline-flex whitespace-nowrap rounded-full bg-[#f2f4f4] px-2.5 py-1 text-[11px] font-semibold text-[#5a6061]"
-      title={`${formatDateMinute(station.lastUpdatedAt)} · ${TRANSIT_DATA_STATUS_LABELS[station.dataStatus]}`}
-    >
-      {formatDateShortMinute(station.lastUpdatedAt)}
-    </span>
+    <div className="min-w-[102px] whitespace-nowrap">
+      <span
+        className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-semibold ${failed ? "bg-[#fff4df] text-[#9a5d12]" : "bg-[#f2f4f4] text-[#5a6061]"}`}
+        title={failed ? station.collectionError || "最近一次站方数据同步失败" : `${formatDateMinute(station.lastUpdatedAt)} · ${TRANSIT_DATA_STATUS_LABELS[station.dataStatus]}`}
+      >
+        {failed ? `检查 ${formatDateShortMinute(checkedAt)}` : formatDateShortMinute(station.lastUpdatedAt)}
+      </span>
+      {failed ? <div className="mt-1 text-[10px] font-semibold text-[#9a5d12]">同步失败</div> : null}
+    </div>
   );
 }
 

@@ -12,9 +12,13 @@ import {
   getStationComparisonSummary,
   getTextStationComparisonSummary,
   getStationPublishedAvailabilitySummary,
+  getTransitAvailabilityFreshness,
+  getTransitStationAvailabilityPresentation,
+  getTransitStationPriceFreshness,
   getStandardModelRateSummary,
   getTransitRecentAvailabilitySampleLookupScopes,
   getTransitAvailabilityRollupPrices,
+  getPreferredTransitAvailabilityRollupPrices,
   getTransitModelSummaries,
   getOfficialTransitModelPrice,
   getNormalizedSourceTags,
@@ -29,12 +33,15 @@ import {
   normalizedTransitCommercialOfferDisclosure,
   getRechargeCoefficientFromRatio,
   formatTransitFixedPriceValue,
+  formatYuanPerDollar,
+  isDollarTransitModelFamily,
   scoreTransitRelativeCost,
   scoreTransitReliability,
   scoreTransitResponseLatency,
 } from "../src/lib/api-transit";
 import {
   TRANSIT_DEFAULT_COMMERCIAL_OFFER_DISCLOSURE,
+  TRANSIT_STANDARD_MODELS,
   type TransitStation,
 } from "../src/data/api-transit/types";
 
@@ -48,7 +55,26 @@ assertEqual(getTransitFocusedFamilyFromReturnQuery("family=claude&model=Kimi%20K
 assertEqual(getTransitFocusedFamilyFromReturnQuery("family=unknown"), null);
 assertEqual(getTransitFocusedFamilyFromReturnQuery(["family=image", "family=video"]), "image");
 assertEqual(getTransitFocusedFamilyFromReturnQuery(null), null);
+assertEqual(TRANSIT_STANDARD_MODELS.includes("Claude Opus 5"), true);
+assertEqual(formatYuanPerDollar(0.09), "¥0.09 / 刀");
+assertEqual(formatYuanPerDollar(0.009), "¥0.009 / 刀");
+assertEqual(isDollarTransitModelFamily("claude"), true);
+assertEqual(isDollarTransitModelFamily("deepseek"), false);
+const emptyClaudeOpus5Summary = getTransitModelSummaries([], "claude")
+  .find((summary) => summary.standardModel === "Claude Opus 5");
+assertEqual(emptyClaudeOpus5Summary?.stationCount, 0);
+assertEqual(emptyClaudeOpus5Summary?.prices.length, 0);
 
+assertDeepEqual(getOfficialTransitModelPrice("Claude Opus 5"), {
+  input: 5,
+  output: 25,
+  cacheWrite: 6.25,
+  cacheRead: 0.5,
+  imageOutput: null,
+  currency: "USD",
+  sourceLabel: "Anthropic API",
+  sourceUrl: "https://platform.claude.com/docs/en/about-claude/pricing",
+});
 assertDeepEqual(getOfficialTransitModelPrice("Kimi K3"), {
   input: 20,
   output: 100,
@@ -268,12 +294,12 @@ const wawa = station({
 });
 
 assertDeepEqual(
-  compareStations([neko, wawa], "overall", { activeFamily: "claude" }).map((item) => item.id),
+  compareStations([neko, wawa], "overall", { activeFamily: "claude", now }).map((item) => item.id),
   ["wawazz-xyz", "999555999-com"],
 );
 
 assertDeepEqual(
-  compareStations([neko, wawa], "rate", { activeFamily: "claude" }).map((item) => item.id),
+  compareStations([neko, wawa], "rate", { activeFamily: "claude", now }).map((item) => item.id),
   ["wawazz-xyz", "999555999-com"],
 );
 
@@ -516,7 +542,7 @@ const expensiveImageStation = imageStation({
   availabilitySamples: 240,
 });
 assertDeepEqual(
-  compareStations([expensiveImageStation, cheapImageStation], "rate", { activeFamily: "image" }).map((item) => item.id),
+  compareStations([expensiveImageStation, cheapImageStation], "rate", { activeFamily: "image", now }).map((item) => item.id),
   ["cheap-image-station", "expensive-image-station"],
 );
 const imageSummary = getTransitModelSummaries([expensiveImageStation, cheapImageStation], "image")
@@ -884,6 +910,62 @@ assertEqual(Math.round((duplicateGptSummary.sevenDayRate || 0) * 100), 99);
 assertDeepEqual(duplicateGptSummary.recentSamples, duplicateProbePrice.availability.recentSamples);
 assertEqual(getAvailabilityEvidenceMeta(duplicatePublicStatusPrice.availability).label, "分组公开监测");
 
+const zeroSampleExactPrice = {
+  ...duplicatePublicStatusPrice,
+  availability: {
+    ...duplicatePublicStatusPrice.availability,
+    sevenDayRate: null,
+    sevenDaySamples: 0,
+    recentSamples: [],
+    sourceType: "unknown" as const,
+    sourceLabel: null,
+    sourceUrl: null,
+    scope: "offer" as const,
+    matchLevel: "exact" as const,
+    monitoringScopeId: "scope:zero-sample-exact",
+  },
+};
+const validModelReferencePrice = {
+  ...duplicatePublicStatusPrice,
+  availability: {
+    ...duplicatePublicStatusPrice.availability,
+    sevenDayRate: 1,
+    sevenDaySamples: 1,
+    sourceType: "public_status" as const,
+    sourceLabel: "公开监测页",
+    sourceUrl: "https://duplicate-availability.example.test/status",
+    scope: "model" as const,
+    matchLevel: "model" as const,
+    monitoringScopeId: "scope:valid-model-reference",
+  },
+};
+const modelFallbackPrices = getPreferredTransitAvailabilityRollupPrices(
+  duplicateAvailabilityStation,
+  [zeroSampleExactPrice, validModelReferencePrice],
+);
+assertEqual(modelFallbackPrices.length, 1);
+assertEqual(modelFallbackPrices[0]?.availability.matchLevel, "model");
+assertEqual(getAvailabilityEvidenceMeta(modelFallbackPrices[0]!.availability).label, "同模型参考");
+assertEqual(getAvailabilityEvidenceMeta(zeroSampleExactPrice.availability).label, "监测样本不足");
+
+const validExactPrice = {
+  ...zeroSampleExactPrice,
+  availability: {
+    ...zeroSampleExactPrice.availability,
+    sevenDayRate: 0.99,
+    sevenDaySamples: 2,
+    sourceType: "public_status" as const,
+    sourceLabel: "公开监测页",
+    sourceUrl: "https://duplicate-availability.example.test/status",
+  },
+};
+const exactPreferredPrices = getPreferredTransitAvailabilityRollupPrices(
+  duplicateAvailabilityStation,
+  [validExactPrice, validModelReferencePrice],
+);
+assertEqual(exactPreferredPrices.length, 1);
+assertEqual(exactPreferredPrices[0]?.availability.matchLevel, "exact");
+
 const sharedGroupEvidenceStation = station({
   id: "shared-group-evidence",
   name: "Shared Group Evidence",
@@ -934,7 +1016,7 @@ familyReferenceStation.prices = sharedGroupModels.map((standardModel, index) => 
 }));
 assertEqual(getFamilyRateSummary(familyReferenceStation, "gpt").sevenDaySamples, 60);
 assertEqual(getFamilyRateSummary(familyReferenceStation, "gpt").referenceOnly, true);
-assertEqual(getTransitStationRankingBreakdowns([familyReferenceStation]).get(familyReferenceStation.id)?.stabilityRate, null);
+assertEqual(getTransitStationRankingBreakdowns([familyReferenceStation], { now }).get(familyReferenceStation.id)?.stabilityRate, null);
 
 const modelEvidenceStation = station({
   id: "model-evidence-station",
@@ -1350,6 +1432,146 @@ const accountPoolOnlySourceStation = station({
 accountPoolOnlySourceStation.channelTypes = [];
 accountPoolOnlySourceStation.accountPools = ["kiro"];
 assertDeepEqual(getNormalizedSourceTags(accountPoolOnlySourceStation), []);
+
+const delayedAvailability = {
+  ...availability(0.99, 60),
+  lastCheckedAt: "2026-07-02T04:00:00.000Z",
+};
+assertEqual(getTransitAvailabilityFreshness(delayedAvailability, now), "delayed");
+
+const staleAvailability = {
+  ...availability(0.99, 60),
+  lastCheckedAt: "2026-07-01T06:59:59.000Z",
+};
+assertEqual(getTransitAvailabilityFreshness(staleAvailability, now), "stale");
+assertEqual(
+  getTransitAvailabilityFreshness(delayedAvailability, now, {
+    collectionStatus: "failed",
+    collectionError: "HTTP 404: Not Found",
+  }),
+  "stale",
+);
+
+const probeFallbackStation = station({
+  id: "probe-fallback",
+  name: "Probe Fallback",
+  claudeRate: 0.2,
+  availabilityRate: 0.995,
+  availabilitySamples: 60,
+});
+const stalePublicEvidence = {
+  ...getStationPublishedAvailabilitySummary(probeFallbackStation),
+  sourceType: "public_status" as const,
+  sourceLabel: "站方公开",
+  lastCheckedAt: "2026-07-01T00:00:00.000Z",
+};
+const probePresentation = getTransitStationAvailabilityPresentation(
+  probeFallbackStation,
+  stalePublicEvidence,
+  now,
+);
+assertEqual(probePresentation.availability.sourceType, "priceai_probe");
+assertEqual(probePresentation.freshness, "fresh");
+assertEqual(Boolean(probePresentation.replacedPublicEvidence), true);
+
+const staleRankingStation = station({
+  id: "stale-ranking",
+  name: "Stale Ranking",
+  claudeRate: 0.01,
+  availabilityRate: 1,
+  availabilitySamples: 600,
+});
+staleRankingStation.availability.lastCheckedAt = "2026-07-01T00:00:00.000Z";
+staleRankingStation.prices[0]!.availability.lastCheckedAt = "2026-07-01T00:00:00.000Z";
+const staleRanking = getTransitStationRankingBreakdowns([staleRankingStation], { now });
+assertEqual(staleRanking.get(staleRankingStation.id)?.eligible, false);
+assertEqual(staleRanking.get(staleRankingStation.id)?.reliabilityScore, 0);
+
+const freshRankingStation = station({
+  id: "fresh-ranking",
+  name: "Fresh Ranking",
+  claudeRate: 0.2,
+  availabilityRate: 0.99,
+  availabilitySamples: 120,
+});
+const delayedRankingStation = station({
+  id: "delayed-ranking",
+  name: "Delayed Ranking",
+  claudeRate: 0.2,
+  availabilityRate: 0.99,
+  availabilitySamples: 120,
+});
+delayedRankingStation.availability.lastCheckedAt = delayedAvailability.lastCheckedAt;
+delayedRankingStation.prices[0]!.availability.lastCheckedAt = delayedAvailability.lastCheckedAt;
+const freshnessRanking = getTransitStationRankingBreakdowns(
+  [freshRankingStation, delayedRankingStation],
+  { now },
+);
+assertEqual(
+  (freshnessRanking.get(delayedRankingStation.id)?.reliabilityScore ?? 0) <
+    (freshnessRanking.get(freshRankingStation.id)?.reliabilityScore ?? 0),
+  true,
+);
+
+const delayedPriceStation = station({
+  id: "delayed-price",
+  name: "Delayed Price",
+  claudeRate: 0.2,
+  availabilityRate: 0.99,
+  availabilitySamples: 120,
+});
+delayedPriceStation.prices[0]!.lastVerifiedAt = "2026-07-02T04:00:00.000Z";
+assertEqual(getTransitStationPriceFreshness(delayedPriceStation, { now }).state, "delayed");
+
+const stalePriceStation = station({
+  id: "stale-price",
+  name: "Stale Price",
+  claudeRate: 0.01,
+  availabilityRate: 0.99,
+  availabilitySamples: 120,
+});
+stalePriceStation.prices[0]!.lastVerifiedAt = "2026-07-01T00:00:00.000Z";
+assertEqual(getTransitStationPriceFreshness(stalePriceStation, { now }).state, "stale");
+stalePriceStation.prices.push({
+  ...stalePriceStation.prices[0]!,
+  standardModel: "Claude Sonnet 5",
+  groupName: "Fresh expensive price",
+  modelMultiplier: 0.5,
+  inputPrice: 0.5,
+  outputPrice: 0.5,
+  cacheReadPrice: 0.5,
+  cacheWritePrice: 0.5,
+  lastVerifiedAt: now,
+});
+assertEqual(
+  getTransitStationPriceFreshness(stalePriceStation, { activeFamily: "claude", now }).state,
+  "stale",
+);
+const stalePriceRanking = getTransitStationRankingBreakdowns([stalePriceStation], { now });
+assertEqual(stalePriceRanking.get(stalePriceStation.id)?.eligible, false);
+assertEqual(stalePriceRanking.get(stalePriceStation.id)?.comparisonRate, null);
+assertEqual(stalePriceRanking.get(stalePriceStation.id)?.costScore, 0);
+
+const freshPriceStation = station({
+  id: "fresh-price",
+  name: "Fresh Price",
+  claudeRate: 0.2,
+  availabilityRate: 0.99,
+  availabilitySamples: 120,
+});
+assertEqual(
+  compareStations([stalePriceStation, freshPriceStation], "rate", { now })[0]?.id,
+  freshPriceStation.id,
+);
+const priceFreshnessRanking = getTransitStationRankingBreakdowns(
+  [freshPriceStation, delayedPriceStation],
+  { now },
+);
+assertEqual(
+  (priceFreshnessRanking.get(delayedPriceStation.id)?.costScore ?? 0) <
+    (priceFreshnessRanking.get(freshPriceStation.id)?.costScore ?? 0),
+  true,
+);
 
 console.log("api transit sorting test passed");
 

@@ -25,8 +25,10 @@ import { TransitLatencyBadge } from "@/components/TransitLatencyBadge";
 import { TransitPriceBreakdown } from "@/components/TransitPriceBreakdown";
 import { TransitStationSystemIcon } from "@/components/TransitStationSystemIcon";
 import { useMediaQuery } from "@/lib/client-hooks";
+import { withPriceAiUtm } from "@/lib/outbound-analytics-client";
 import { formatDateDay, formatDateMinute, formatDateShortMinute } from "@/lib/utils";
 import type {
+  TransitCommercialOffer,
   TransitModelFamily,
   TransitMultiplierHistoryPoint,
   TransitModelPrice,
@@ -136,6 +138,8 @@ type TransitPriceGroup = {
 type TransitOutboundIntent = {
   url: string;
   isAff: boolean;
+  offerId?: string | null;
+  label?: string | null;
 };
 
 type StoredRiskConfirmation = {
@@ -162,6 +166,7 @@ export default function TransitStationDetail({ station, children }: Props) {
   const verificationEvents = getTransitVerificationEvents(station);
   const outboundOffer = getPrimaryTransitOutboundOffer(station);
   const outboundUrl = getTransitStationOutboundUrl(station, outboundOffer);
+  const trackedOutboundUrl = transitOutboundUrl(station, outboundUrl, outboundOffer);
   const hasAffRelation = hasTransitAffRelation(station);
   const isAffOutbound = isTransitStationOutboundAff(station, outboundOffer);
   const outboundLabel = outboundOffer?.url ? "优惠入口" : "官网";
@@ -194,7 +199,9 @@ export default function TransitStationDetail({ station, children }: Props) {
 
   const requestOutboundVisit = useCallback(
     (event: MouseEvent<HTMLAnchorElement>, intent: TransitOutboundIntent) => {
-      if (hasValidRiskConfirmation(station.slug, intent.url)) return;
+      if (hasValidRiskConfirmation(station.slug, intent.url)) {
+        return;
+      }
       event.preventDefault();
       setRememberRiskConfirmation(false);
       setPendingOutbound(intent);
@@ -245,10 +252,10 @@ export default function TransitStationDetail({ station, children }: Props) {
                   ) : null}
                 </div>
                 <a
-                  href={outboundUrl}
+                  href={trackedOutboundUrl}
                   target="_blank"
                   rel="noopener noreferrer"
-                  onClick={(event) => requestOutboundVisit(event, { url: outboundUrl, isAff: isAffOutbound })}
+                  onClick={(event) => requestOutboundVisit(event, { url: trackedOutboundUrl, isAff: isAffOutbound, offerId: outboundOffer?.id || null, label: outboundLabel })}
                   aria-label={`访问 ${station.name} ${outboundLabel}`}
                   className="mt-1 inline-flex max-w-full items-center gap-1 text-sm font-semibold text-[#5a6061] transition-colors hover:text-[#2d3435]"
                 >
@@ -299,10 +306,10 @@ export default function TransitStationDetail({ station, children }: Props) {
             />
             <div className="mt-4 flex flex-wrap gap-2">
               <a
-                href={outboundUrl}
+                href={trackedOutboundUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                onClick={(event) => requestOutboundVisit(event, { url: outboundUrl, isAff: isAffOutbound })}
+                onClick={(event) => requestOutboundVisit(event, { url: trackedOutboundUrl, isAff: isAffOutbound, offerId: outboundOffer?.id || null, label: outboundButtonLabel })}
                 className="inline-flex h-10 items-center gap-1.5 rounded-full bg-[#2d3435] px-4 text-sm font-bold text-[#f8f8f8] transition-colors hover:bg-[#202829]"
               >
                 {outboundButtonLabel}
@@ -743,6 +750,14 @@ function getUrlHost(url: string) {
   } catch {
     return "unknown";
   }
+}
+
+function transitOutboundUrl(station: TransitStation, value: string, offer: TransitCommercialOffer | null): string {
+  return withPriceAiUtm(value, {
+    medium: "api_transit",
+    campaign: "priceai_api_transit",
+    content: offer?.id || station.slug,
+  });
 }
 
 function CommercialOfferCard({
